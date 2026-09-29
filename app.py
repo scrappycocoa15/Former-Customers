@@ -8,6 +8,7 @@ import io
 import re
 import json
 import requests
+import urllib.parse
 import pandas as pd
 import streamlit as st
 from pathlib import Path
@@ -380,6 +381,14 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 
+# ── Session state ─────────────────────────────────────────────────────────────
+# Results are cached here so that clicking Download (which triggers a Streamlit
+# rerun) does not wipe the screen.
+
+if "results" not in st.session_state:
+    st.session_state.results = None
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
@@ -402,6 +411,27 @@ with st.sidebar:
         placeholder="00D…",
         label_visibility="collapsed",
     )
+
+    test_btn = st.button("Test Connection", use_container_width=True)
+    if test_btn:
+        if not session_id.strip():
+            st.warning("Paste a Session ID first.", icon="⚠️")
+        else:
+            with st.spinner("Testing…"):
+                try:
+                    resp = requests.get(
+                        f"{INSTANCE_URL}/services/data/{API_VERSION}/",
+                        headers={"Authorization": f"Bearer {session_id.strip()}"},
+                        timeout=10,
+                    )
+                    if resp.status_code == 200:
+                        st.success("Connected", icon="✅")
+                    elif resp.status_code in (401, 403):
+                        st.error("Invalid or expired Session ID.", icon="🔒")
+                    else:
+                        st.error(f"Unexpected response: {resp.status_code}", icon="⚠️")
+                except Exception as exc:
+                    st.error(f"Connection failed: {exc}", icon="⚠️")
 
     st.markdown("---")
     st.markdown("#### Territory Maps")
@@ -463,76 +493,69 @@ with st.sidebar:
 st.markdown("# Former Customer Account Reassignment")
 st.caption(f"Report: `{REPORT_ID}` · Instance: `{INSTANCE_URL}`")
 
-if not run_btn:
+# ── Run when button is clicked ────────────────────────────────────────────────
+
+if run_btn:
+    errors = []
+    if not session_id.strip():
+        errors.append("A Salesforce Session ID is required.")
+    if not maps_ready:
+        errors.append("Territory maps have not been saved yet. Upload them in the sidebar first.")
+    if errors:
+        for e in errors:
+            st.error(e)
+        st.stop()
+
+    with st.spinner("Loading territory maps…"):
+        try:
+            gb_lookup  = build_lookup(GB_PATH)
+            nat_lookup = build_lookup(NAT_PATH)
+        except Exception as exc:
+            st.error(f"Territory map error: {exc}")
+            st.stop()
+
+    with st.spinner("Fetching report from Salesforce…"):
+        try:
+            raw_data = fetch_report(session_id.strip())
+            df_raw   = parse_report(raw_data)
+            if not raw_data.get("allData", True):
+                st.warning(
+                    "The report contains more than 2,000 rows. "
+                    "Salesforce returned the first 2,000 only.",
+                    icon="⚠️",
+                )
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+        except Exception as exc:
+            st.error(f"Unexpected error fetching report: {exc}")
+            st.stop()
+
+    with st.spinner("Processing accounts…"):
+        processed        = process_accounts(df_raw, gb_lookup, nat_lookup)
+        ready_df, rsd_df = split_results(processed)
+
+    # Cache so reruns (e.g. from download clicks) preserve the results
+    st.session_state.results = {
+        "processed": processed,
+        "ready_df":  ready_df,
+        "rsd_df":    rsd_df,
+    }
+
+# ── Show placeholder if no results yet ───────────────────────────────────────
+
+if st.session_state.results is None:
     st.info(
-        "Enter your Salesforce Session ID, upload both territory maps, "
-        "then click **Fetch & Process Accounts**.",
+        "Enter your Salesforce Session ID, then click **Fetch & Process Accounts**.",
         icon="ℹ️",
     )
     st.stop()
 
-# ── Validate inputs ───────────────────────────────────────────────────────────
+# ── Restore results from session state ───────────────────────────────────────
 
-errors = []
-if not session_id.strip():
-    errors.append("A Salesforce Session ID is required.")
-if not maps_ready:
-    errors.append("Territory maps have not been saved yet. Upload them in the sidebar first.")
-if errors:
-    for e in errors:
-        st.error(e)
-    st.stop()
-
-# ── Load territory maps from disk ─────────────────────────────────────────────
-
-with st.spinner("Loading territory maps…"):
-    try:
-        gb_lookup  = build_lookup(GB_PATH)
-        nat_lookup = build_lookup(NAT_PATH)
-        st.success(
-            f"Territory maps ready — "
-            f"GB: {len(gb_lookup):,} ZIPs | National: {len(nat_lookup):,} ZIPs"
-        )
-    except Exception as exc:
-        st.error(f"Territory map error: {exc}")
-        st.stop()
-
-# ── Fetch Salesforce report ───────────────────────────────────────────────────
-
-with st.spinner("Fetching report from Salesforce…"):
-    try:
-        raw_data = fetch_report(session_id.strip())
-        df_raw   = parse_report(raw_data)
-
-        if not raw_data.get("allData", True):
-            st.warning(
-                "The report contains more than 2,000 rows. "
-                "Salesforce returned the first 2,000 only. "
-                "Consider splitting the report or using a filtered view.",
-                icon="⚠️",
-            )
-
-        st.success(f"Report fetched — {len(df_raw):,} accounts loaded")
-    except ValueError as exc:
-        st.error(str(exc))
-        st.stop()
-    except requests.HTTPError as exc:
-        st.error(f"Salesforce returned an error: {exc}")
-        st.stop()
-    except Exception as exc:
-        st.error(f"Unexpected error fetching report: {exc}")
-        st.stop()
-
-# ── Optional: show raw columns for debugging ──────────────────────────────────
-
-with st.expander("Raw columns returned by Salesforce report (for diagnostics)", expanded=False):
-    st.write(list(df_raw.columns))
-
-# ── Process ───────────────────────────────────────────────────────────────────
-
-with st.spinner("Processing accounts…"):
-    processed       = process_accounts(df_raw, gb_lookup, nat_lookup)
-    ready_df, rsd_df = split_results(processed)
+processed = st.session_state.results["processed"]
+ready_df  = st.session_state.results["ready_df"]
+rsd_df    = st.session_state.results["rsd_df"]
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
 
@@ -585,10 +608,30 @@ with tab2:
 st.markdown("---")
 st.markdown("#### Export")
 
-filename     = f"Account_Reassignments_{datetime.today().strftime('%Y_%m')}.xlsx"
-excel_bytes  = build_excel(ready_df, rsd_df)
-eml_bytes    = build_eml(excel_bytes, filename, n_ready, n_rsd)
-eml_filename = f"Reassignment_Email_{datetime.today().strftime('%Y_%m')}.eml"
+filename    = f"Account_Reassignments_{datetime.today().strftime('%Y_%m')}.xlsx"
+excel_bytes = build_excel(ready_df, rsd_df)
+
+# Build mailto: URL — opens Outlook directly with To/Subject/Body pre-filled
+month_label    = datetime.today().strftime("%B %Y")
+mailto_subject = f"Account Reassignment Updates - {month_label}"
+mailto_body    = (
+    f"Hello,\n\n"
+    f"Please make the following updates for {n_ready} former customer accounts "
+    f"(see Tab: Account Reassignments in the attached file):\n\n"
+    f"  1. Update Account Owner to the New Account Owner listed\n"
+    f"  2. Update the FY18 Sales Planning field "
+    f"(Prev Acct Owner remarks have been removed)\n"
+    f"  3. Update Marketing Tier to Tier 4\n\n"
+    f"Fields highlighted in blue indicate the values to be applied.\n\n"
+    f"An additional {n_rsd} account(s) in the 'Ask RSD & Unmatched' tab "
+    f"require manual territory review before reassignment.\n\n"
+    f"Please confirm once complete.\n\nThank you"
+)
+mailto_url = (
+    f"mailto:{EMAIL_TO}"
+    f"?subject={urllib.parse.quote(mailto_subject)}"
+    f"&body={urllib.parse.quote(mailto_body)}"
+)
 
 col_dl, col_em = st.columns(2)
 
@@ -606,14 +649,22 @@ with col_dl:
     )
 
 with col_em:
-    st.download_button(
-        label="Generate Email Draft (.eml)",
-        data=eml_bytes,
-        file_name=eml_filename,
-        mime="message/rfc822",
-        use_container_width=True,
+    st.markdown(
+        f"""<a href="{mailto_url}" style="
+            display:block;
+            padding:0.45rem 1rem;
+            background-color:#0070F2;
+            color:white !important;
+            text-decoration:none;
+            border-radius:4px;
+            font-weight:600;
+            text-align:center;
+            font-size:0.875rem;
+            line-height:1.6;
+        ">Open Email in Outlook</a>""",
+        unsafe_allow_html=True,
     )
     st.caption(
-        f"Opens in Outlook pre-addressed to {EMAIL_TO} "
-        "with the Excel file attached. Review and send."
+        f"Opens Outlook pre-addressed to {EMAIL_TO} with subject and body filled in. "
+        "Attach the downloaded Excel before sending."
     )
