@@ -139,17 +139,26 @@ def _find_owner_columns(df: pd.DataFrame):
 
 def build_lookup(file_obj) -> dict:
     """
-    Read an uploaded territory Excel/CSV and build
+    Read a territory Excel/CSV (uploaded file-like object or Path) and build
     a  zip5 → {'id': ..., 'name': ...}  dict.
     """
-    xl     = pd.ExcelFile(file_obj)
-    sheet  = _find_zip_sheet(xl)
-    df     = xl.parse(sheet)
-    id_col, name_col = _find_owner_columns(df)
+    # Determine engine from filename so Path objects work as well as uploads
+    name = str(getattr(file_obj, "name", file_obj)).lower()
+    if name.endswith(".csv"):
+        df_all = pd.read_csv(file_obj)
+        zip_sheet_df = df_all
+        sheet_data = df_all
+        xl = None
+    else:
+        engine = "openpyxl" if name.endswith(".xlsx") else "xlrd"
+        xl     = pd.ExcelFile(file_obj, engine=engine)
+        sheet  = _find_zip_sheet(xl)
+        sheet_data = xl.parse(sheet)
+    id_col, name_col = _find_owner_columns(sheet_data)
 
-    zips = df["Zip Code"].astype(str).str.strip()
+    zips = sheet_data["Zip Code"].astype(str).str.strip()
     mask = zips.str.match(r"^\d+(\.\d+)?$")      # skip non-numeric (data noise)
-    clean = df[mask].copy()
+    clean = sheet_data[mask].copy()
     clean["_z5"] = (clean["Zip Code"]
                     .astype(float).astype(int)
                     .astype(str).str.zfill(5))
